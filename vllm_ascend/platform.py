@@ -426,6 +426,21 @@ class NPUPlatform(Platform):
             else:
                 parallel_config.worker_cls = "vllm_ascend.worker.worker.NPUWorker"
 
+        # Handle DBO on Ascend: vLLM asserts all2all_backend must be deepep_*
+        # when use_ubatching is True, but Ascend uses its own MoE communication.
+        # Set to a value that passes vLLM validation.
+        if parallel_config and parallel_config.use_ubatching:
+            if parallel_config.all2all_backend not in [
+                "deepep_low_latency",
+                "deepep_high_throughput",
+            ]:
+                parallel_config.all2all_backend = "deepep_low_latency"
+                logger.info(
+                    "DBO enabled on Ascend: overriding all2all_backend to "
+                    "'deepep_low_latency' to satisfy vLLM config validation. "
+                    "Actual MoE communication uses Ascend-native mechanisms."
+                )
+
         refresh_block_size(vllm_config)
 
         # Activate custom ops for v1, except on 310P

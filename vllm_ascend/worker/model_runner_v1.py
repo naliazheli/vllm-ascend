@@ -84,7 +84,9 @@ from vllm.v1.worker.cp_utils import (
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, GPUModelRunner
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
+    check_ubatch_thresholds,
     maybe_create_ubatch_slices,
+    split_attn_metadata,
 )
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -159,6 +161,62 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+
+
+def _ascend_split_attn_metadata(
+    ubatch_slices: list,
+    cm: AscendCommonAttentionMetadata,
+) -> list[AscendCommonAttentionMetadata]:
+    """Wrap upstream split_attn_metadata to preserve Ascend-specific fields.
+
+    The upstream split_attn_metadata returns CommonAttentionMetadata objects
+    which lack Ascend-specific fields (positions, attn_state, etc.).
+    This wrapper calls the upstream function, then enriches each result.
+    """
+    base_results = split_attn_metadata(ubatch_slices, cm)
+    ascend_results: list[AscendCommonAttentionMetadata] = []
+    for base_cm, ub_slice in zip(base_results, ubatch_slices):
+        token_slice = ub_slice.token_slice
+        request_slice = ub_slice.request_slice
+        num_ub_tokens = token_slice.stop - token_slice.start
+        ascend_cm = AscendCommonAttentionMetadata(
+            # Fields from CommonAttentionMetadata (already computed)
+            query_start_loc=base_cm.query_start_loc,
+            query_start_loc_cpu=base_cm.query_start_loc_cpu,
+            seq_lens=base_cm.seq_lens,
+            num_reqs=base_cm.num_reqs,
+            num_actual_tokens=base_cm.num_actual_tokens,
+            max_query_len=base_cm.max_query_len,
+            max_seq_len=base_cm.max_seq_len,
+            block_table_tensor=base_cm.block_table_tensor,
+            slot_mapping=base_cm.slot_mapping,
+            _seq_lens_cpu=base_cm._seq_lens_cpu,
+            _num_computed_tokens_cpu=base_cm._num_computed_tokens_cpu,
+            # Ascend-specific fields
+            seq_lens_cpu=(
+                cm.seq_lens_cpu[request_slice]
+                if cm.seq_lens_cpu is not None else None
+            ),
+            num_computed_tokens_cpu=(
+                cm.num_computed_tokens_cpu[request_slice]
+                if cm.num_computed_tokens_cpu is not None else None
+            ),
+            decode_token_per_req=cm.decode_token_per_req,
+            actual_seq_lengths_q=(
+                cm.actual_seq_lengths_q[token_slice.start:token_slice.stop]
+                if cm.actual_seq_lengths_q else []
+            ),
+            positions=(
+                cm.positions[token_slice.start:token_slice.stop]
+                if cm.positions is not None else None
+            ),
+            attn_state=cm.attn_state,
+            graph_pad_size=cm.graph_pad_size,
+            num_input_tokens=num_ub_tokens,
+            prefill_context_parallel_metadata=None,
+        )
+        ascend_results.append(ascend_cm)
+    return ascend_results
 
 
 @dataclass
@@ -1920,7 +1978,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray,
         max_num_scheduled_tokens: int,
         use_cascade_attn: bool,
-        allow_microbatching: bool = False,
+        allow_microbatching: bool = True,
         force_eager: bool = False,
         # For cudagraph capture TODO(lucas): Refactor how we capture cudagraphs (will
         # be improved in model runner v2)
@@ -1970,10 +2028,18 @@ class NPUModelRunner(GPUModelRunner):
             assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (
                 "Sequence parallelism requires num_tokens to be a multiple of tensor parallel size"
             )
-        # Extra coordination when running data-parallel since we need to coordinate
-        # across ranks
+        # Determine if microbatching (DBO) should be used.
+        # For DP=1, should_ubatch is always False (matching GPU behavior:
+        # coordinate_batch_across_dp returns False for DP=1 since there is
+        # no DP communication to overlap with compute).
         should_ubatch, num_tokens_across_dp = False, None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
+            if allow_microbatching:
+                should_ubatch = check_ubatch_thresholds(
+                    self.parallel_config,
+                    num_tokens,
+                    uniform_decode=uniform_decode,
+                )
             _, num_tokens_across_dp, synced_cudagraph_mode = self._sync_batch_across_dp(
                 num_tokens_padded=num_tokens_padded,
                 cudagraph_mode=cudagraph_mode.value,
@@ -2217,7 +2283,11 @@ class NPUModelRunner(GPUModelRunner):
                     spec_decode_common_attn_metadata = cm
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
-                _build_attn_group_metadata(kv_cache_gid, attn_gid, cm)
+                if ubatch_slices is not None:
+                    for ubid, _cm in enumerate(_ascend_split_attn_metadata(ubatch_slices, cm)):
+                        _build_attn_group_metadata(kv_cache_gid, attn_gid, _cm, ubid)
+                else:
+                    _build_attn_group_metadata(kv_cache_gid, attn_gid, cm)
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
             for req_id in self.input_batch.req_ids:
@@ -2322,7 +2392,8 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
-        _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
+        (_cudagraph_mode, batch_desc, should_ubatch,
+         num_tokens_across_dp, _) = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
             num_reqs=num_reqs,
             num_scheduled_tokens_np=num_scheduled_tokens,
@@ -2362,8 +2433,13 @@ class NPUModelRunner(GPUModelRunner):
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded
             num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
-        # vllm-ascend does not support ubatch now
-        ubatch_slices, ubatch_slices_padded = None, None
+        ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+            should_ubatch=should_ubatch,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_tokens_padded=num_tokens_padded,
+            num_reqs_padded=num_reqs_padded,
+            num_ubatches=self.parallel_config.num_ubatches,
+        )
         attn_metadata: PerLayerAttnMetadata | None = None
         # Build attention metadata for dummy_run
         if self._should_build_dummy_attn_metadata(force_attention, is_profile, cudagraph_runtime_mode):
@@ -3161,16 +3237,22 @@ class NPUModelRunner(GPUModelRunner):
             attn_backends_map: dict[AttentionBackend, list[str]], kv_cache_group_id: int
         ) -> list[AttentionGroup]:
             attn_groups: list[AttentionGroup] = []
+            num_builders = (
+                self.parallel_config.num_ubatches
+                if self.parallel_config.use_ubatching
+                else 1
+            )
             for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
                 attn_metadata_builders = []
-                attn_metadata_builders.append(
-                    attn_backend.get_builder_cls()(
-                        kv_cache_spec,
-                        layer_names,
-                        self.vllm_config,
-                        self.device,
+                for _ in range(num_builders):
+                    attn_metadata_builders.append(
+                        attn_backend.get_builder_cls()(
+                            kv_cache_spec,
+                            layer_names,
+                            self.vllm_config,
+                            self.device,
+                        )
                     )
-                )
                 attn_group = AttentionGroup(
                     attn_backend, layer_names, kv_cache_spec, kv_cache_group_id, attn_metadata_builders
                 )

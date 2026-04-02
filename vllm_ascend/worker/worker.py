@@ -312,7 +312,7 @@ class NPUWorker(WorkerBase):
         # for more details
         self.device = self._init_device()
         # Initialize workspace manager
-        num_ubatches = 1
+        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
         # Init ModelRunner here, so that we have access to self.device.
         if self.use_v2_model_runner:
