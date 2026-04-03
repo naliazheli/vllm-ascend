@@ -440,6 +440,26 @@ class NPUPlatform(Platform):
                     "'deepep_low_latency' to satisfy vLLM config validation. "
                     "Actual MoE communication uses Ascend-native mechanisms."
                 )
+            # DBO is designed for MoE DP+EP deployments (overlap sparse
+            # all-to-all communication in MoE layers with surrounding compute).
+            # Warn when running DBO outside that intended configuration.
+            if model_config is not None and not is_moe_model(vllm_config):
+                logger.warning(
+                    "DBO (--enable-dbo) is designed for MoE models with "
+                    "expert parallelism (--enable-expert-parallel). "
+                    "The current model is dense (no MoE layers), so DBO only "
+                    "enables ubatch splitting without any compute/communication "
+                    "overlap benefit. Use a MoE model with --enable-expert-parallel "
+                    "for meaningful DBO validation."
+                )
+            elif parallel_config and not parallel_config.enable_expert_parallel:
+                logger.warning(
+                    "DBO (--enable-dbo) is enabled but --enable-expert-parallel "
+                    "is not set. DBO targets DP+EP deployments where MoE "
+                    "all-to-all communication can be overlapped with compute. "
+                    "Without EP, the MoE dispatch/combine all-to-all is absent "
+                    "and DBO provides no communication overlap benefit."
+                )
 
         refresh_block_size(vllm_config)
 

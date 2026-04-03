@@ -85,6 +85,7 @@ from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, GPUModelR
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
+    is_last_ubatch_empty,
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
@@ -1425,18 +1426,6 @@ class NPUModelRunner(GPUModelRunner):
         clear_kv_metadata = self.speculative_config is None
         with (
             record_function_or_nullcontext("forward"),
-            set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                aclgraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
-                model_instance=self.model,
-                max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
-                skip_compiled=has_encoder_input,
-            ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 **(
@@ -1444,9 +1433,87 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
+            if ubatch_slices is not None:
+                # DBO: sequential dual-execution loop.
+                # Ascend equivalent of GPU's UBatchWrapper._run_ubatches.
+                # Each ubatch gets its own forward_context so every attention
+                # layer receives a single dict (not a list), which is the
+                # correct interface for all backends.
+                #
+                # GPU runs both ubatches concurrently on separate CUDA streams
+                # to overlap MoE all-to-all with compute.  Ascend runs them
+                # sequentially here as a first step; true communication/compute
+                # overlap requires dbo_yield hooks in FusedMoE (TODO).
+                ubatch_hs_list: list[torch.Tensor] = []
+                dp_size = self.vllm_config.parallel_config.data_parallel_size
+                for ubid, ubatch_slice in enumerate(ubatch_slices_attn):
+                    tok_sl = ubatch_slice.token_slice
+                    ub_num_tokens = tok_sl.stop - tok_sl.start
+                    ub_input_ids = (
+                        input_ids[tok_sl] if input_ids is not None else None
+                    )
+                    ub_positions = (
+                        positions[:, tok_sl] if positions.ndim == 2
+                        else positions[tok_sl]
+                    )
+                    ub_inputs_embeds = (
+                        inputs_embeds[tok_sl] if inputs_embeds is not None else None
+                    )
+                    ub_intermediate = (
+                        intermediate_tensors[tok_sl]
+                        if intermediate_tensors is not None
+                        else None
+                    )
+                    ub_num_tokens_across_dp = (
+                        torch.tensor(
+                            [ub_num_tokens] * dp_size,
+                            device="cpu",
+                            dtype=torch.int32,
+                        )
+                        if num_tokens_across_dp is not None
+                        else None
+                    )
+                    with set_ascend_forward_context(
+                        attn_metadata[ubid],
+                        self.vllm_config,
+                        num_tokens=ub_num_tokens,
+                        num_tokens_across_dp=ub_num_tokens_across_dp,
+                        aclgraph_runtime_mode=cudagraph_mode,
+                        batch_descriptor=batch_desc,
+                        num_actual_tokens=ub_num_tokens,
+                        model_instance=self.model,
+                        max_tokens_across_pcp=(
+                            0 if self.pcp_size == 1
+                            else self.pcp_manager.max_num_tokens_across_pcp
+                        ),
+                        skip_compiled=has_encoder_input,
+                    ):
+                        ub_hs = self._model_forward(
+                            ub_num_tokens,
+                            ub_input_ids,
+                            ub_positions,
+                            ub_intermediate,
+                            ub_inputs_embeds,
+                            **model_kwargs,
+                        )
+                    ubatch_hs_list.append(ub_hs)
+                hidden_states = torch.cat(ubatch_hs_list, dim=0)
+            else:
+                with set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    aclgraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                    model_instance=self.model,
+                    max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
+                    skip_compiled=has_encoder_input,
+                ):
+                    hidden_states = self._model_forward(
+                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                    )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2032,14 +2099,33 @@ class NPUModelRunner(GPUModelRunner):
         # For DP=1, should_ubatch is always False (matching GPU behavior:
         # coordinate_batch_across_dp returns False for DP=1 since there is
         # no DP communication to overlap with compute).
+        #
+        # NOTE(DBO/Ascend): Models with GDN (Gated Delta Network / linear
+        # attention) layers must NOT ubatch. GDN is a recurrent / state-based
+        # mechanism: splitting the token batch across two sequential forward
+        # passes gives wrong results because the second pass loses the recurrent
+        # state built by the first.  The _has_gdn guard must stay even though
+        # the sequential dual-execution loop is now implemented (execute_model
+        # and _dummy_run both dispatch per-ubatch set_ascend_forward_context).
+        # TODO(future): for mixed models, only skip the GDN layers' ubatching.
         should_ubatch, num_tokens_across_dp = False, None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
-            if allow_microbatching:
+            if allow_microbatching and not self._has_gdn:
                 should_ubatch = check_ubatch_thresholds(
                     self.parallel_config,
                     num_tokens,
                     uniform_decode=uniform_decode,
                 )
+                if should_ubatch and is_last_ubatch_empty(
+                    num_tokens,
+                    num_tokens_padded,
+                    self.parallel_config.num_ubatches,
+                ):
+                    # Abort: the padded batch is too small to fill all ubatches.
+                    # GPU does this via _post_process_ubatch inside
+                    # coordinate_batch_across_dp; Ascend's _sync_batch_across_dp
+                    # skips that check, so we guard here instead.
+                    should_ubatch = False
             _, num_tokens_across_dp, synced_cudagraph_mode = self._sync_batch_across_dp(
                 num_tokens_padded=num_tokens_padded,
                 cudagraph_mode=cudagraph_mode.value,
@@ -2554,20 +2640,79 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
-            with set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                in_profile_run=is_profile,
-                num_actual_tokens=num_tokens_padded,
-                aclgraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_desc,
-                model_instance=self.model,
-            ):
-                outputs = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
+            if ubatch_slices is not None and attn_metadata is not None:
+                # DBO: sequential dual-execution — same pattern as execute_model.
+                # _dummy_run is used for warmup/profile; running each ubatch
+                # separately ensures every attention layer receives a dict.
+                ubatch_hs_list: list[torch.Tensor] = []
+                dp_size = self.vllm_config.parallel_config.data_parallel_size
+                _ubatch_slices_attn = (
+                    ubatch_slices_padded
+                    if cudagraph_runtime_mode == CUDAGraphMode.FULL
+                    else ubatch_slices
                 )
+                for ubid, ubatch_slice in enumerate(_ubatch_slices_attn):
+                    tok_sl = ubatch_slice.token_slice
+                    ub_num_tokens = tok_sl.stop - tok_sl.start
+                    ub_input_ids = (
+                        input_ids[tok_sl] if input_ids is not None else None
+                    )
+                    ub_positions = (
+                        positions[:, tok_sl] if positions.ndim == 2
+                        else positions[tok_sl]
+                    )
+                    ub_inputs_embeds = (
+                        inputs_embeds[tok_sl] if inputs_embeds is not None else None
+                    )
+                    ub_intermediate = (
+                        intermediate_tensors[tok_sl]
+                        if intermediate_tensors is not None
+                        else None
+                    )
+                    ub_num_tokens_across_dp = (
+                        torch.tensor(
+                            [ub_num_tokens] * dp_size,
+                            device="cpu",
+                            dtype=torch.int32,
+                        )
+                        if num_tokens_across_dp is not None
+                        else None
+                    )
+                    with set_ascend_forward_context(
+                        attn_metadata[ubid],
+                        self.vllm_config,
+                        num_tokens=ub_num_tokens,
+                        num_tokens_across_dp=ub_num_tokens_across_dp,
+                        in_profile_run=is_profile,
+                        num_actual_tokens=ub_num_tokens,
+                        aclgraph_runtime_mode=cudagraph_runtime_mode,
+                        batch_descriptor=batch_desc,
+                        model_instance=self.model,
+                    ):
+                        ub_hs = self._model_forward(
+                            ub_num_tokens,
+                            ub_input_ids,
+                            ub_positions,
+                            ub_intermediate,
+                            ub_inputs_embeds,
+                        )
+                    ubatch_hs_list.append(ub_hs)
+                outputs = torch.cat(ubatch_hs_list, dim=0)
+            else:
+                with set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    in_profile_run=is_profile,
+                    num_actual_tokens=num_tokens_padded,
+                    aclgraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_desc,
+                    model_instance=self.model,
+                ):
+                    outputs = self._model_forward(
+                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
+                    )
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
