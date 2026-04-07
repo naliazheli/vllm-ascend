@@ -7,6 +7,7 @@ from tests.ut.base import TestBase
 from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     AlltoAllCommImpl,
+    DeepEPCommImpl,
     MC2CommImpl,
 )
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
@@ -126,6 +127,44 @@ class TestMoECommMethod(TestBase):
             hidden_states, router_logits, False, False, QuantType.NONE)
 
         # Test finalize method
+        comm_impl.finalize(h_out,
+                           reduce_results=True,
+                           padded_hidden_states_shape=padded_hidden_states_shape)
+        mock_pf_instance.finalize.assert_called_once_with(h_out, True, None)
+
+    @patch('vllm_ascend.ascend_forward_context.get_forward_context')
+    @patch(
+        "vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithMC2")
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithDeepEP")
+    def test_deepep_comm_impl(self, mock_token_dispatcher, mock_prepare_finalize,
+                              mock_get_forward_context):
+        mock_context = MagicMock()
+        mock_context.moe_comm_method = "deepep"
+        mock_get_forward_context.return_value = mock_context
+
+        mock_pf_instance = MagicMock()
+        mock_pf_instance.prepare.return_value = MoEPrepareOutput(
+            hidden_states=torch.randn(4, 8),
+            router_logits=torch.randn(4, 2),
+            mc2_mask=torch.tensor([1, 0, 1, 0]),
+            padded_hidden_states_shape=None)
+        mock_pf_instance.finalize.return_value = torch.randn(4, 8)
+        mock_prepare_finalize.return_value = mock_pf_instance
+
+        mock_td_instance = MagicMock()
+        mock_token_dispatcher.return_value = mock_td_instance
+
+        comm_impl = DeepEPCommImpl(self.moe_config)
+
+        hidden_states = torch.randn(3, 8)
+        router_logits = torch.randn(3, 2)
+        prepare_output = comm_impl.prepare(hidden_states, router_logits)
+        h_out = prepare_output.hidden_states
+        padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
+
+        mock_pf_instance.prepare.assert_called_once_with(
+            hidden_states, router_logits, False, False, QuantType.NONE)
+
         comm_impl.finalize(h_out,
                            reduce_results=True,
                            padded_hidden_states_shape=padded_hidden_states_shape)

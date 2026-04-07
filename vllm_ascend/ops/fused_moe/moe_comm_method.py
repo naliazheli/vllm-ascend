@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from importlib.util import find_spec
 
 import torch
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
@@ -41,6 +42,7 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     MoETokenDispatcher,
     TokenDispatcherWithAll2AllV,
     TokenDispatcherWithAllGather,
+    TokenDispatcherWithDeepEP,
     TokenDispatcherWithMC2,
 )
 from vllm_ascend.quantization.quant_type import QuantType
@@ -57,6 +59,10 @@ def setup_moe_comm_method(moe_config):
     _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
     _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
     _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
+    if envs_ascend.VLLM_ASCEND_ENABLE_DEEPEP and find_spec("deep_ep") is not None:
+        _MoECommMethods[MoECommType.DEEPEP] = DeepEPCommImpl(moe_config)
+    else:
+        _MoECommMethods.pop(MoECommType.DEEPEP, None)
 
 
 def set_gmmswigluquant_method():
@@ -314,3 +320,17 @@ class FusedMC2CommImpl(MoECommMethod):
         else:
             raise ValueError(f"Wrong value of {envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2=}")
         return FusedExpertsResult(routed_out=out, expert_tokens=expert_tokens)
+
+
+class DeepEPCommImpl(MoECommMethod):
+    """Experimental DeepEP-based communication backend for Ascend MoE."""
+
+    def _get_token_dispatcher(self) -> MoETokenDispatcher:
+        return TokenDispatcherWithDeepEP(
+            top_k=self.moe_config.experts_per_token,
+            num_experts=self.moe_config.num_experts,
+            num_local_experts=self.moe_config.num_local_experts,
+        )
+
+    def _get_prepare_finalize(self) -> PrepareAndFinalize:
+        return PrepareAndFinalizeWithMC2(self.moe_config)

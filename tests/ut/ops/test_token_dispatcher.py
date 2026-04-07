@@ -25,6 +25,7 @@ from tests.ut.base import TestBase
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
     MoEAllToAllCombineMetadata,
+    MoEDeepEPCombineMetadata,
     MoEMC2CombineMetadata,
     MoEQuantParams,
     MoERoutingParams,
@@ -34,6 +35,7 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (  # isort: skip
     AscendDeviceType,
     TokenDispatcherWithAll2AllV,
     TokenDispatcherWithAllGather,
+    TokenDispatcherWithDeepEP,
     TokenDispatcherWithMC2,
 )
 from vllm_ascend.ops.fused_moe.moe_stage_params import MoEMxfpParams
@@ -545,6 +547,78 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         self.assertIsNotNone(result.group_list)
         self.assertIsNotNone(result.dynamic_scale)
         self.assertEqual(result.group_list_type, 1)
+
+
+class TestTokenDispatcherWithDeepEP(TestBase):
+
+    def setUp(self):
+        patcher1 = patch("vllm_ascend.ops.fused_moe.token_dispatcher.get_ep_group")
+        self.mock_get_ep_group = patcher1.start()
+        self.addCleanup(patcher1.stop)
+        self.mock_get_ep_group.return_value = MagicMock(device_group="fake_ep_group")
+
+        self.mock_buffer = MagicMock()
+        self.mock_deep_ep = MagicMock()
+        self.mock_deep_ep.Buffer.return_value = self.mock_buffer
+
+        patcher2 = patch("vllm_ascend.ops.fused_moe.token_dispatcher.import_module", return_value=self.mock_deep_ep)
+        self.mock_import_module = patcher2.start()
+        self.addCleanup(patcher2.stop)
+
+        self.dispatcher = TokenDispatcherWithDeepEP(top_k=2, num_experts=4, num_local_experts=2)
+
+    def test_init(self):
+        self.mock_import_module.assert_called_once_with("deep_ep")
+        self.mock_deep_ep.Buffer.assert_called_once_with("fake_ep_group")
+
+    def test_token_dispatch(self):
+        hidden_states = torch.randn(4, 8)
+        topk_weights = torch.rand(4, 2)
+        topk_ids = torch.randint(0, 4, (4, 2), dtype=torch.int64)
+
+        self.mock_buffer.get_dispatch_layout.return_value = (
+            torch.tensor([2, 2], dtype=torch.int32),
+            None,
+            torch.tensor([1, 1, 1, 1], dtype=torch.int32),
+            torch.ones(4, 2, dtype=torch.bool),
+            None,
+        )
+        self.mock_buffer.dispatch.return_value = (
+            torch.randn(6, 8),
+            torch.randint(0, 4, (6, 2), dtype=torch.int64),
+            torch.rand(6, 2),
+            [3, 3],
+            ("mock_handle",),
+            None,
+        )
+
+        token_dispatch_input = build_token_dispatch_input_fixture(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+        result = self.dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+
+        self.mock_buffer.get_dispatch_layout.assert_called_once()
+        self.mock_buffer.dispatch.assert_called_once()
+        self.assertEqual(result.group_list_type, 1)
+        self.assertIsInstance(result.combine_metadata, MoEDeepEPCombineMetadata)
+        self.assertEqual(result.group_list.tolist(), [3, 3])
+
+    def test_token_combine(self):
+        hidden_states = torch.randn(6, 8)
+        combine_metadata = MoEDeepEPCombineMetadata(
+            handle=("mock_handle",),
+            recv_topk_idx=torch.randint(0, 4, (6, 2), dtype=torch.int64),
+            recv_topk_weights=torch.rand(6, 2),
+            num_recv_tokens_per_expert=torch.tensor([3, 3], dtype=torch.int64),
+        )
+        self.mock_buffer.combine.return_value = (torch.randn(4, 8), None, None)
+
+        output = self.dispatcher.token_combine(hidden_states, combine_metadata)
+
+        self.mock_buffer.combine.assert_called_once()
+        self.assertEqual(output.shape, (4, 8))
         self.assertIsInstance(result.combine_metadata, MoEAllToAllCombineMetadata)
 
     @pytest.mark.skip(

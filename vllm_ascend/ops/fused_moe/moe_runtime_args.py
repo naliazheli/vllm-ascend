@@ -63,6 +63,7 @@ import vllm_ascend.ops.fused_moe.moe_stage_params as _stage_params
 from vllm_ascend.ops.fused_moe.moe_stage_contracts import (
     MoEAllGatherCombineMetadata,
     MoEAllToAllCombineMetadata,
+    MoEDeepEPCombineMetadata,
     MoEFusedExpertsInput,
     MoEMC2CombineMetadata,
     MoEMlpComputeInput,
@@ -228,6 +229,7 @@ def build_mlp_compute_input(
 __all__ = [
     "MoEAllGatherCombineMetadata",
     "MoEAllToAllCombineMetadata",
+    "MoEDeepEPCombineMetadata",
     "MoEFusedExpertsInput",
     "MoEMC2CombineMetadata",
     "MoEMlpComputeInput",

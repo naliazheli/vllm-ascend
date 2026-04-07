@@ -1,4 +1,5 @@
 import math
+from importlib.util import find_spec
 from contextlib import contextmanager
 from enum import Enum
 from typing import Any
@@ -28,6 +29,7 @@ class MoECommType(Enum):
     MC2 = 1
     ALLTOALL = 2
     FUSED_MC2 = 3
+    DEEPEP = 4
 
 
 @contextmanager
@@ -200,6 +202,10 @@ def get_mc2_mask():
     return _reserved_mc2_mask
 
 
+def _deep_ep_available() -> bool:
+    return find_spec("deep_ep") is not None
+
+
 def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_model=False) -> MoECommType | None:
     """Select the MoE communication method according to parallel settings,
     device generation, token count, and quantization.
@@ -248,6 +254,8 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             moe_comm_type = MoECommType.ALLGATHER
 
     elif soc_version in {AscendDeviceType.A3}:
+        if envs_ascend.VLLM_ASCEND_ENABLE_DEEPEP and (not is_draft_model) and _deep_ep_available():
+            return MoECommType.DEEPEP
         # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
         # TODO: drop speculative method guard when dispatch_gmm_combine_decode supports w16a16
         fused_mc2_enable = envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2

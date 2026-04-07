@@ -21,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
+from importlib import import_module
 from typing import Generic
 
 import torch
@@ -35,6 +36,7 @@ from vllm_ascend.ops.fused_moe.comm_utils import async_all_to_all, gather_from_s
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
     MoEAllToAllCombineMetadata,
+    MoEDeepEPCombineMetadata,
     MoEMC2CombineMetadata,
     MoETokenDispatchInput,
     MoETokenDispatchOutput,
@@ -293,6 +295,78 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             else torch_npu.npu_moe_distribute_combine(**kwargs_mc2)
         )
 
+        return combined_output
+
+
+class TokenDispatcherWithDeepEP(MoETokenDispatcher[MoEDeepEPCombineMetadata]):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.num_local_experts = kwargs.get("num_local_experts", 0)
+        try:
+            deep_ep = import_module("deep_ep")
+        except ImportError as exc:
+            raise ImportError(
+                "DeepEP backend requested, but Python package 'deep_ep' is not installed."
+            ) from exc
+        self.buffer = deep_ep.Buffer(self.ep_group)
+
+    def token_dispatch(
+        self,
+        token_dispatch_input: MoETokenDispatchInput,
+    ) -> MoETokenDispatchOutput[MoEDeepEPCombineMetadata]:
+        hidden_states = token_dispatch_input.hidden_states
+        topk_ids = token_dispatch_input.topk_ids
+        topk_weights = token_dispatch_input.topk_weights.to(torch.float32)
+        (
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+            is_token_in_rank,
+            _,
+        ) = self.buffer.get_dispatch_layout(topk_ids, self.num_experts)
+        (
+            recv_hidden_states,
+            recv_topk_idx,
+            recv_topk_weights,
+            num_recv_tokens_per_expert_list,
+            handle,
+            _,
+        ) = self.buffer.dispatch(
+            x=hidden_states,
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            topk_idx=topk_ids,
+            topk_weights=topk_weights,
+        )
+        if isinstance(recv_hidden_states, tuple):
+            raise NotImplementedError("PR1 DeepEP backend only supports non-quantized dispatch output.")
+
+        num_recv_tokens_per_expert = torch.tensor(
+            num_recv_tokens_per_expert_list,
+            dtype=torch.int64,
+            device=hidden_states.device,
+        )
+        return MoETokenDispatchOutput(
+            hidden_states=recv_hidden_states,
+            group_list=num_recv_tokens_per_expert,
+            group_list_type=1,
+            combine_metadata=MoEDeepEPCombineMetadata(
+                handle=handle,
+                recv_topk_idx=recv_topk_idx,
+                recv_topk_weights=recv_topk_weights,
+                num_recv_tokens_per_expert=num_recv_tokens_per_expert,
+            ),
+        )
+
+    def token_combine(self, hidden_states, combine_metadata, bias=None):
+        assert bias is None, "Bias is not supported in TokenDispatcherWithDeepEP."
+        combined_output, _, _ = self.buffer.combine(
+            x=hidden_states,
+            handle=combine_metadata.handle,
+            topk_weights=combine_metadata.recv_topk_weights,
+        )
         return combined_output
 
 

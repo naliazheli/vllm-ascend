@@ -113,6 +113,14 @@ class MoEAllToAllCombineMetadata:
 
 
 @dataclass(frozen=True, slots=True)
+class MoEDeepEPCombineMetadata:
+    handle: tuple | list
+    recv_topk_idx: torch.Tensor | None
+    recv_topk_weights: torch.Tensor | None
+    num_recv_tokens_per_expert: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
 class MoETokenDispatchOutput(Generic[TMoECombineMetadata]):
     hidden_states: torch.Tensor
     group_list: torch.Tensor
@@ -148,6 +156,7 @@ __all__ = [
     "MoEMC2CombineMetadata",
     "MoEAllGatherCombineMetadata",
     "MoEAllToAllCombineMetadata",
+    "MoEDeepEPCombineMetadata",
     "MoETokenDispatchOutput",
     "MoEMlpComputeInput",
     "TMoECombineMetadata",
